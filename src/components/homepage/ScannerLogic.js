@@ -33,7 +33,7 @@ class ScannerLogic {
 
     // Force detection of "maggie"
     const detection = {
-      label: "Dark Fantasy",
+      label: "maggie",
       confidence: 1.0,
       box: { x: 100, y: 100, w: 200, h: 200 }
     };
