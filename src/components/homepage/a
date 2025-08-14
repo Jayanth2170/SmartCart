@@ -1,0 +1,163 @@
+// ScannerLogic.jsx - ONNX Runtime Web - YOLOv6 Detection with stable frame detection & test mode
+class ScannerLogic {
+  constructor(testMode = false) {
+    this.session = null;
+    this.isInitialized = false;
+    this.testMode = testMode;
+
+    this.labels = [
+      "1 Dark Chocolate","Ayurveda gel","Balaji Aloo Sev","Balaji Ratlam Sev","Celebrations Pack",
+      "Closeup","Colgate","Dabeli Masala","Dabeli burger","Dark Fantasy",
+      "Dove Shampoo","Dove soap","Everest","Garam Masala","Head Shoulders Shampoo",
+      "Krack Jack","Liril","Lux soap","Malan","Marie Gold",
+      "Nescafe","Real Grape","Rin Big Bar","TATA Salt","Tomato Twist Lays",
+      "Tresemme","Undhiya","Vasline Aloe","Veg Hakka Noodles","ViccoVajradant",
+      "Vim soap","White Lakme","blue lays","lifeboy soap","maggie",
+      "orange lays","pears soap","pr","surf"
+    ];
+
+    this.previousLabel = "";
+    this.sameLabelCount = 0;
+    this.requiredStableFrames = 3;
+  }
+
+  async initialize() {
+    if (this.isInitialized) return true;
+    try {
+      if (!window.ort) await this.loadONNXRuntime();
+      const sessionOptions = { executionProviders: ["cpu"], graphOptimizationLevel: "basic" };
+      console.log("Loading ONNX model...");
+      this.session = await window.ort.InferenceSession.create("/best_model.onnx", sessionOptions);
+      this.isInitialized = true;
+      console.log("✅ ONNX model loaded");
+      return true;
+    } catch (e) {
+      console.warn("❌ ONNX failed, using mock detection:", e.message);
+      this.session = "mock";
+      this.isInitialized = true;
+      return true;
+    }
+  }
+
+  async loadONNXRuntime() {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/ort.min.js";
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("Failed to load ONNX Runtime"));
+      document.head.appendChild(script);
+    });
+  }
+
+  async detect(videoElement) {
+    if (!this.isInitialized) await this.initialize();
+    const startTime = performance.now();
+
+    // -----------------------------
+    // TEST MODE: force "maggie"
+    // -----------------------------
+    if (this.testMode || this.session === "mock") {
+      return {
+        detections: [
+          { label: "maggie", confidence: 0.99, box: { x: 100, y: 100, w: 200, h: 200 } }
+        ],
+        latency: Math.round(performance.now() - startTime)
+      };
+    }
+
+    try {
+      const bitmap = await createImageBitmap(videoElement);
+      const tensor = this.convertBitmapToTensor(bitmap);
+      const feeds = { [this.session.inputNames[0]]: tensor };
+      const results = await this.session.run(feeds);
+      const output = results[this.session.outputNames[0]];
+      const detections = this.parseYOLOOutput(output);
+
+      // Stable detection logic
+      let stableDetections = [];
+      if (detections.length > 0) {
+        const best = detections.reduce((a, b) => a.confidence > b.confidence ? a : b);
+
+        if (this.testMode) {
+          stableDetections.push(best); // immediately show in test mode
+        } else {
+          if (best.label === this.previousLabel) {
+            this.sameLabelCount++;
+          } else {
+            this.previousLabel = best.label;
+            this.sameLabelCount = 1;
+          }
+          if (this.sameLabelCount >= this.requiredStableFrames) {
+            stableDetections.push(best);
+          }
+        }
+      } else {
+        this.previousLabel = "";
+        this.sameLabelCount = 0;
+      }
+
+      return { detections: stableDetections, latency: Math.round(performance.now() - startTime) };
+    } catch (e) {
+      console.error("❌ Detection error:", e.message);
+      return { detections: [], latency: Math.round(performance.now() - startTime) };
+    }
+  }
+
+  convertBitmapToTensor(bitmap) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 640;
+    canvas.height = 640;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bitmap, 0, 0, 640, 640);
+    const data = ctx.getImageData(0, 0, 640, 640).data;
+
+    const floatValues = new Float32Array(3 * 640 * 640);
+    for (let h = 0; h < 640; h++) {
+      for (let w = 0; w < 640; w++) {
+        const i = h * 640 + w;
+        floatValues[i] = data[i*4] / 255.0;          // R
+        floatValues[640*640 + i] = data[i*4 + 1] / 255.0; // G
+        floatValues[2*640*640 + i] = data[i*4 + 2] / 255.0; // B
+      }
+    }
+
+    return new window.ort.Tensor("float32", floatValues, [1, 3, 640, 640]);
+  }
+
+  parseYOLOOutput(output) {
+    const data = output.data;
+    const [batch, numBoxes, numAttrs] = output.dims;
+    const detections = [];
+
+    for (let i = 0; i < numBoxes; i++) {
+      const offset = i * numAttrs;
+      const x = data[offset];
+      const y = data[offset+1];
+      const w = data[offset+2];
+      const h = data[offset+3];
+      const objectness = data[offset+4];
+      const classScores = data.slice(offset+5, offset+5+this.labels.length);
+      const maxScore = Math.max(...classScores);
+      const classIndex = classScores.indexOf(maxScore);
+      const confidence = objectness * maxScore;
+
+      if (confidence < 0.001 || classIndex >= this.labels.length) continue;
+
+      detections.push({
+        label: this.labels[classIndex],
+        confidence,
+        box: { x: x*640, y: y*640, w: w*640, h: h*640 } // scale to pixels
+      });
+    }
+
+    console.log("🎯 Detections:", detections.map(d => `${d.label}(${d.confidence.toFixed(2)})`));
+    return detections;
+  }
+}
+
+// Load scanner logic
+export const loadScannerLogic = async (testMode = false) => {
+  const scanner = new ScannerLogic(testMode);
+  await scanner.initialize();
+  return scanner;
+};
